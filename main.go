@@ -3,71 +3,97 @@ package main
 import (
 	"log"
 	"net/http"
-	"net/url"
 	"os"
-	"time"
+	"regexp"
+	"strings"
 
 	"github.com/gorilla/handlers"
 	"github.com/gorilla/mux"
 )
 
-var port string
+var router *mux.Router
+var listenPort string
+var tenantsRegexp string
+var basicAuthPrefixes string
+var ipRegex = regexp.MustCompile(`^(.+?)(?::\d{0,5})?$`)
 
 func init() {
-	port = os.Getenv("PORT")
-	if len(port) == 0 {
+	listenPort = os.Getenv("PORT")
+	if len(listenPort) == 0 {
 		log.Println("No port specified, using 8080 as default.")
-		port = "8080"
+		listenPort = "8080"
+	}
+	tenants := []string{}
+	for tenant := range config.Tenants {
+		tenants = append(tenants, tenant)
+	}
+	tenantsRegexp = "(?:" + strings.Join(tenants, "|") + ")"
+	basicAuthPrefixes = "(?:" + regexp.MustCompile(` +`).ReplaceAllString(config.BasicAuthPrefixes, "|") + ")"
+}
+
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+	returnStatus(w, http.StatusOK, "OK")
+}
+
+func noAuthHandler(w http.ResponseWriter, r *http.Request) {
+	returnStatus(w, http.StatusOK, "")
+}
+
+func returnStatus(w http.ResponseWriter, statusCode int, errorMsg string) {
+	w.WriteHeader(statusCode)
+	if errorMsg != "" {
+		w.Write([]byte(errorMsg))
 	}
 }
 
-func parseEnvURL(URLEnv string) *url.URL {
-	envContent := os.Getenv(URLEnv)
-	parsedURL, err := url.ParseRequestURI(envContent)
+func getTenant(r *http.Request) string {
+	return mux.Vars(r)["tenant"]
+}
+
+func getCookiePath(r *http.Request) (string, error) {
+	route := mux.CurrentRoute(r)
+	vars := mux.Vars(r)
+	url, err := route.URLPath("tenant", vars["tenant"], "prefix", vars["prefix"])
 	if err != nil {
-		log.Fatal("Not a valid URL for env variable ", URLEnv, ": ", envContent, "\n")
+		log.Println(getUserIP(r), "Error retrieving route URL:", err.Error())
+		return "", err
 	}
-
-	return parsedURL
+	s := url.Path
+	if !strings.HasSuffix(s, "/") {
+		if idx := strings.LastIndex(s, "/"); idx != -1 && idx != len(s) {
+			s = s[:idx+1]
+		}
+	}
+	return s, nil
 }
 
-func parseEnvVar(envVar string) string {
-	envContent := os.Getenv(envVar)
-
-	if len(envContent) == 0 {
-		log.Fatal("Env variable ", envVar, " missing, exiting.")
+func getUserIP(r *http.Request) string {
+	headerIP := r.Header.Get("X-Forwarded-For")
+	if headerIP != "" {
+		return headerIP
 	}
 
-	return envContent
-}
-
-func scheduleBlacklistUpdater(seconds int) {
-	for {
-		time.Sleep(time.Duration(seconds) * time.Second)
-		go updateBlacklist()
-	}
-}
-
-// HealthHandler responds to /healthz endpoint for application monitoring
-func HealthHandler(w http.ResponseWriter, r *http.Request) {
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("OK"))
+	return ipRegex.FindStringSubmatch(r.RemoteAddr)[1]
 }
 
 func main() {
-	wh := newWildcardHandler()
+	router = mux.NewRouter()
 
-	router := mux.NewRouter()
-	router.HandleFunc("/healthz", HealthHandler).Methods(http.MethodGet)
-	router.HandleFunc("/login/oidc", OIDCHandler).Methods(http.MethodGet)
-	router.HandleFunc("/login", LoginHandler).Methods(http.MethodGet)
-	router.HandleFunc("/logout", LogoutHandler).Methods(http.MethodGet)
-	router.PathPrefix("/").Handler(wh)
+	router.HandleFunc("/healthz", healthHandler).Methods(http.MethodGet)
 
-	updateBlacklist()
-	go scheduleBlacklistUpdater(60)
+	router.Path("/login/oidc").HandlerFunc(oidcHandler).Methods(http.MethodGet)
 
-	var listenPort = ":" + port
-	log.Println("Starting web server at", listenPort)
-	log.Fatal(http.ListenAndServe(listenPort, handlers.CORS()(router)))
+	basic := router.PathPrefix("/{prefix:" + basicAuthPrefixes + "}/{tenant:" + tenantsRegexp + "}/").Subrouter()
+	basic.PathPrefix("/").HandlerFunc(ifLoggedIn(setClaims, basicAuthLogin))
+
+	implicit := router.PathPrefix("/{tenant:" + tenantsRegexp + "}/").Subrouter()
+	implicit.Path("/login").HandlerFunc(ifLoggedIn(setClaims, login)).Methods(http.MethodGet)
+	implicit.Path("/logout").HandlerFunc(ifLoggedIn(logout, beginOIDCLogout)).Methods(http.MethodGet)
+	implicit.PathPrefix("/").HandlerFunc(ifLoggedIn(setClaims, implicitFlowLogin))
+
+	router.PathPrefix("/").HandlerFunc(noAuthHandler)
+
+	var listenAddr = ":" + listenPort
+	log.Println("Starting web server at", listenAddr)
+	log.Fatal(http.ListenAndServe(listenAddr, handlers.CORS()(router)))
 }

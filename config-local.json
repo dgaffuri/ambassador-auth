@@ -1,0 +1,20 @@
+{
+	"basic_auth_prefixes": "mobile external",
+	"tenants": {
+		"reply": {
+			"oidc_provider": "http://localhost:8081/auth/realms/master",
+			"client_id": "ambassador",
+			"client_secret": "2988e582-f9ec-480d-b26f-5d27f27c8fda",
+			"oidc_scopes": "profile email"
+		},
+		"fca": {
+			"oidc_provider": "http://localhost:8081/auth/realms/master",
+			"client_id": "ambassador",
+			"client_secret": "2988e582-f9ec-480d-b26f-5d27f27c8fda",
+			"oidc_scopes": "profile email"
+		}
+	},
+	"redis" : {
+		"addr": "localhost:6379"
+	}
+}

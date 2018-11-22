@@ -1,0 +1,12 @@
+{
+  "configurations": [
+    {
+      "name": "SetEnvironment",
+      "mode": "debug",
+      "env": {
+        "CONFIG_FILE": "./config-local.json",
+        "PORT": "8090"
+      }
+    }
+  ]
+}

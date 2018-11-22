@@ -1,2 +1,4 @@
-ambassador-auth-oidc
-vendor
+.project
+oidc-config.json
+Gopkg.lock
+debug
