@@ -1,16 +1,17 @@
 {
 	"basic_auth_prefixes": "mobile external",
+	"signing_key_file": "./ambassador.key",
 	"tenants": {
 		"reply": {
-			"oidc_provider": "http://localhost:8081/auth/realms/master",
+			"oidc_provider": "http://localhost:8081/auth/realms/reply",
 			"client_id": "ambassador",
-			"client_secret": "2988e582-f9ec-480d-b26f-5d27f27c8fda",
+			"client_secret": "7da1d220-d6a3-44f6-990f-bbb453a8624b",
 			"oidc_scopes": "profile email"
 		},
-		"fca": {
-			"oidc_provider": "http://localhost:8081/auth/realms/master",
+		"sideup": {
+			"oidc_provider": "http://localhost:8081/auth/realms/sideup",
 			"client_id": "ambassador",
-			"client_secret": "2988e582-f9ec-480d-b26f-5d27f27c8fda",
+			"client_secret": "47490e1d-ef74-4e4b-b409-9ca803c4fa08",
 			"oidc_scopes": "profile email"
 		}
 	},

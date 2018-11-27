@@ -56,6 +56,10 @@ type accessTokenClaims struct {
 	ResourceAccess map[string]map[string]interface{} `json:"resource_access"`
 }
 
+const cookieName = "auth"
+const expiryDelta = 10 * time.Second
+const tokenRefreshing = "REFRESHING"
+
 var ctx context.Context
 var oidcConfigMap = make(map[string]*oidcConfig)
 var redisdb *redis.Client
@@ -102,7 +106,8 @@ func initConfig(r *http.Request, oidcConfig *oidcConfig) error {
 	}
 
 	oidcConfig.config = &oidc.Config{
-		ClientID: tenantConfig.ClientID,
+		ClientID:        tenantConfig.ClientID,
+		SkipExpiryCheck: true,
 	}
 
 	oidcConfig.oauth2Config = oauth2.Config{
@@ -189,7 +194,7 @@ func unmarshalResp(r *http.Response, body []byte, v interface{}) error {
 	return fmt.Errorf("expected Content-Type = application/json, got %q: %v", ct, err)
 }
 
-// from oidc.NewProvider
+// from oidc.NewProvider end
 
 func getOIDCConfig(r *http.Request) (*oidcConfig, error) {
 
@@ -215,28 +220,44 @@ func ifLoggedIn(yes func(w http.ResponseWriter, r *http.Request, claims *accessT
 
 	return func(w http.ResponseWriter, r *http.Request) {
 
-		// check for valid access token in cookie and try to refresh or call yes/no function
 		url := r.URL.String()
-		claims, err := parseCookie(r)
-		if err != nil {
-			if strings.Contains(err.Error(), "oidc: token is expired") {
-				if doRefresh(w, r) {
-					return
-				}
-				log.Println(getUserIP(r), url, "Token expired but can't refresh.")
-			} else if !strings.Contains(err.Error(), "http: named cookie not present") {
-				log.Println(getUserIP(r), url, "Problem parsing cookie:", err.Error(), ".")
-			}
-		} else {
 
-			// logged in with signed access token
-			log.Println(getUserIP(r), url, "Already logged in", claims.Username, ".")
-			yes(w, r, claims)
+		// check for valid access token in cookie or Authorization header
+		token, err := checkAccessToken(r)
+		if token == nil {
+			if err != nil {
+				log.Println(getUserIP(r), url, "Error retrieving access token:", err.Error())
+			}
+			no(w, r)
 			return
 		}
 
-		// not logged in
-		no(w, r)
+		// get claims
+		var claims accessTokenClaims
+		err = token.Claims(&claims)
+		if err != nil {
+			log.Println(getUserIP(r), url, "Error getting token claims:", err.Error())
+			no(w, r)
+			return
+		}
+
+		// check expiration and try to refresh if needed
+		if token.Expiry.Before(time.Now().Add(-expiryDelta)) {
+			switch doRefresh(w, r) {
+			case 0:
+				log.Println(getUserIP(r), url, "Token expired but can't refresh for", claims.Username)
+				no(w, r)
+				return
+			case 1:
+				log.Println(getUserIP(r), url, "Token is refreshing for", claims.Username, "allowing access")
+			case 2:
+				log.Println(getUserIP(r), url, "Token refreshed for", claims.Username)
+				return
+			}
+		}
+
+		// logged in with signed access token
+		yes(w, r, &claims)
 	}
 }
 
@@ -253,7 +274,7 @@ func setClaims(w http.ResponseWriter, r *http.Request, claims *accessTokenClaims
 	}
 	w.Header().Set("X-Remote-Groups", roles)
 	w.Header().Set("X-Tenant", getTenant(r))
-	w.Header().Set("X-Trusted", "true")
+	w.Header().Set("X-Trusted", signedNonce())
 	returnStatus(w, http.StatusOK, "")
 }
 
@@ -362,35 +383,52 @@ func implicitFlowLogin(w http.ResponseWriter, r *http.Request) {
 	beginOIDCLogin(w, r, r.URL.String())
 }
 
-func doRefresh(w http.ResponseWriter, r *http.Request) bool {
+func doRefresh(w http.ResponseWriter, r *http.Request) int8 {
 	url := r.URL.String()
-	cookie, err := r.Cookie("auth")
-	if err != nil {
-		return false
+
+	cookie, err := r.Cookie(cookieName)
+	if err != nil || cookie.Value == "" {
+		return 0
 	}
 	accessToken := cookie.Value
-	if accessToken == "" {
-		return false
-	}
-	dbKey := shasum(accessToken)
-	refreshToken, err := redisdb.Get(dbKey).Result()
-	if err != nil {
-		log.Println(getUserIP(r), url, "Failed to retrieve refresh token for", dbKey, err.Error())
-		return false
-	}
-	err = redisdb.Del(dbKey).Err()
-	if err != nil {
-		log.Println(getUserIP(r), url, "Failed to delete refresh token for", dbKey, err.Error())
-	}
+
 	oidcConfig, err := getOIDCConfig(r)
 	if err != nil {
 		log.Println(getUserIP(r), url, "Failed to retrieve OIDC configuration:", err.Error())
-		return false
+		return 0
 	}
 	cookiePath, err := getCookiePath(r)
 	if err != nil {
 		log.Println(getUserIP(r), url, "Failed to retrieve cookie path:", err.Error())
-		return false
+		return 0
+	}
+
+	dbKey := shasum(accessToken)
+	expiration, err := redisdb.PTTL(dbKey).Result()
+	if err != nil {
+		log.Println(getUserIP(r), url, "Failed to retrieve refresh token TTL for", dbKey, err.Error())
+		return 0
+	}
+	if expiration.String() == "-2ms" {
+		log.Println(getUserIP(r), url, "No refresh token for", dbKey)
+		return 0
+	}
+	refreshToken, err := redisdb.GetSet(dbKey, tokenRefreshing).Result()
+	if err != nil {
+		log.Println(getUserIP(r), url, "Failed to retrieve and set refresh token for", dbKey, err.Error())
+		return 0
+	}
+	if expiration.String() == "-1ms" || refreshToken != tokenRefreshing {
+		expiration = expiryDelta
+	}
+	log.Println(getUserIP(r), url, "Expiring refresh token entry for", dbKey, "in", expiration)
+	err = redisdb.Expire(dbKey, expiration).Err()
+	if err != nil {
+		log.Println(getUserIP(r), url, "Failed to expire refresh token entry for", dbKey, err.Error())
+	}
+	if refreshToken == tokenRefreshing {
+		log.Println(getUserIP(r), url, "Token is currently been refreshed for", dbKey, "grace period expires in", expiration)
+		return 1
 	}
 
 	// without AccessToken token is invalid, so refresh token will be used to obtain a new one
@@ -398,21 +436,21 @@ func doRefresh(w http.ResponseWriter, r *http.Request) bool {
 	oauth2Token, err := oidcConfig.oauth2Config.TokenSource(ctx, token).Token()
 	if err != nil {
 		log.Println(getUserIP(r), url, "Failed to refresh token:", err.Error())
-		return false
+		return 0
 	}
 
 	_, err = getAccessToken(oauth2Token, oidcConfig)
 	if err != nil {
 		log.Println(getUserIP(r), err)
 		returnStatus(w, http.StatusInternalServerError, err.Error())
-		return false
+		return 0
 	}
 
 	log.Println(getUserIP(r), url, "Login validated with token from stored refresh token")
 	addCookie(w, getUserIP(r), url, oauth2Token.AccessToken, cookiePath, oidcConfig.cookieDomain, oidcConfig.cookieSecure)
 	http.Redirect(w, r, url, http.StatusFound)
 
-	return true
+	return 2
 }
 
 func login(w http.ResponseWriter, r *http.Request) {
@@ -457,6 +495,14 @@ func beginOIDCLogout(w http.ResponseWriter, r *http.Request) {
 	cookiePath, err := getCookiePath(r)
 	if err == nil {
 		expireCookie(w, r, cookiePath, oidcConfig.cookieDomain, oidcConfig.cookieSecure)
+	}
+	cookie, err := r.Cookie(cookieName)
+	if err == nil {
+		dbKey := shasum(cookie.Value)
+		err = redisdb.Del(dbKey).Err()
+		if err != nil {
+			log.Println(getUserIP(r), r.URL.String(), "Failed to delete refresh token for", dbKey, err.Error())
+		}
 	}
 	redirectURI := r.FormValue("return")
 	if oidcConfig.logoutURL == "" {
@@ -503,10 +549,12 @@ func getAccessToken(oauth2Token *oauth2.Token, oidcConfig *oidcConfig) (*oidc.ID
 		if refreshToken.Expiry > 0 {
 			expiry = time.Until(time.Unix(refreshToken.Expiry, 0))
 		}
-		err = redisdb.Set(shasum(oauth2Token.AccessToken), oauth2Token.RefreshToken, expiry).Err()
+		dbKey := shasum(oauth2Token.AccessToken)
+		err = redisdb.Set(dbKey, oauth2Token.RefreshToken, expiry).Err()
 		if err != nil {
-			log.Println("unable to save Refresh token:", err)
+			log.Println("unable to save Refresh token for", dbKey, err)
 		}
+		log.Println("saved Refresh token for", dbKey, "expiry is", expiry)
 	}
 
 	return accessToken, nil
@@ -538,7 +586,7 @@ func parseRefreshToken(p string) (*refreshToken, error) {
 func addCookie(w http.ResponseWriter, ip string, url string, tokenString string, path string, domain string, secure bool) {
 	log.Println(ip, url, "Setting cookie for domain", domain, "and path", path)
 	cookie := &http.Cookie{
-		Name:     "auth",
+		Name:     cookieName,
 		Value:    tokenString,
 		Path:     path,
 		Domain:   domain,
@@ -548,22 +596,21 @@ func addCookie(w http.ResponseWriter, ip string, url string, tokenString string,
 	http.SetCookie(w, cookie)
 }
 
-func parseCookie(r *http.Request) (*accessTokenClaims, error) {
+func checkAccessToken(r *http.Request) (*oidc.IDToken, error) {
 	var encoded string
 	header := r.Header.Get("Authorization")
 	if strings.HasPrefix(header, "Bearer ") {
 		encoded = header[7:]
 	} else {
-		cookie, err := r.Cookie("auth")
+		cookie, err := r.Cookie(cookieName)
 		if err != nil {
+			if strings.Contains(err.Error(), "http: named cookie not present") {
+				err = nil
+			}
 			return nil, err
 		}
 		encoded = cookie.Value
 	}
-	if len(encoded) == 0 {
-		return nil, fmt.Errorf("Empty token")
-	}
-	var claims accessTokenClaims
 	oidcConfig, err := getOIDCConfig(r)
 	if err != nil {
 		return nil, err
@@ -573,17 +620,13 @@ func parseCookie(r *http.Request) (*accessTokenClaims, error) {
 	if err != nil {
 		return nil, err
 	}
-	err = token.Claims(&claims)
-	if err != nil {
-		return nil, err
-	}
-	return &claims, nil
+	return token, nil
 }
 
 func expireCookie(w http.ResponseWriter, r *http.Request, path string, domain string, secure bool) {
 	log.Println(getUserIP(r), r.URL.String(), "Expiring cookie for domain", domain, "and path", path)
 	cookie := &http.Cookie{
-		Name:     "auth",
+		Name:     cookieName,
 		Value:    "",
 		Expires:  time.Now().AddDate(0, 0, -2),
 		Path:     path,
