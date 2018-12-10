@@ -50,6 +50,10 @@ func getTenant(r *http.Request) string {
 	return mux.Vars(r)["tenant"]
 }
 
+func isWebSocket(r *http.Request) bool {
+	return strings.ToLower(r.Header.Get("Upgrade")) == "websocket"
+}
+
 func getCookiePath(r *http.Request) (string, error) {
 	route := mux.CurrentRoute(r)
 	vars := mux.Vars(r)

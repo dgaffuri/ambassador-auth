@@ -110,11 +110,19 @@ func initConfig(r *http.Request, oidcConfig *oidcConfig) error {
 		SkipExpiryCheck: true,
 	}
 
+	host := r.Host
+	hostParts := strings.Split(host, ":")
+	if len(hostParts) == 2 {
+		port := hostParts[1]
+		if (proto == "http" && port == "80") || (proto == "https" && port == "443") {
+			host = hostParts[0]
+		}
+	}
 	oidcConfig.oauth2Config = oauth2.Config{
 		ClientID:     tenantConfig.ClientID,
 		ClientSecret: tenantConfig.ClientSecret,
 		Endpoint:     oidcConfig.provider.Endpoint(),
-		RedirectURL:  proto + "://" + r.Host + "/login/oidc",
+		RedirectURL:  proto + "://" + host + "/login/oidc",
 		Scopes:       append(strings.Split(tenantConfig.OIDCScopes, " "), oidc.ScopeOpenID),
 	}
 
@@ -243,6 +251,11 @@ func ifLoggedIn(yes func(w http.ResponseWriter, r *http.Request, claims *accessT
 
 		// check expiration and try to refresh if needed
 		if token.Expiry.Before(time.Now().Add(-expiryDelta)) {
+			if isWebSocket(r) {
+				log.Println(getUserIP(r), url, "Token expired but will not refresh on websocket for", claims.Username)
+				no(w, r)
+				return
+			}
 			switch doRefresh(w, r) {
 			case 0:
 				log.Println(getUserIP(r), url, "Token expired but can't refresh for", claims.Username)
@@ -312,7 +325,7 @@ func oidcHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, err = getAccessToken(oauth2Token, oidcConfig)
+	_, err = getAccessToken(oauth2Token, oidcConfig, true)
 	if err != nil {
 		log.Println(getUserIP(r), err)
 		returnStatus(w, http.StatusInternalServerError, err.Error())
@@ -352,13 +365,14 @@ func basicAuthLogin(w http.ResponseWriter, r *http.Request) {
 		returnStatus(w, http.StatusBadRequest, "unable to get token with password credentials")
 		return
 	}
-	accessToken, err := getAccessToken(oauth2Token, oidcConfig)
+	webSocket := isWebSocket(r)
+	accessToken, err := getAccessToken(oauth2Token, oidcConfig, !webSocket)
 	if err != nil {
 		log.Println(getUserIP(r), url, err)
 		returnStatus(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if strings.ToLower(r.Header.Get("Upgrade")) == "websocket" {
+	if webSocket {
 		var claims accessTokenClaims
 		if err = accessToken.Claims(&claims); err != nil {
 			log.Println(getUserIP(r), url, err)
@@ -421,6 +435,10 @@ func doRefresh(w http.ResponseWriter, r *http.Request) int8 {
 	if expiration.String() == "-1ms" || refreshToken != tokenRefreshing {
 		expiration = expiryDelta
 	}
+	// minimum expiration for Redis is 1s
+	if expiration < time.Second {
+		expiration = time.Second
+	}
 	log.Println(getUserIP(r), url, "Expiring refresh token entry for", dbKey, "in", expiration)
 	err = redisdb.Expire(dbKey, expiration).Err()
 	if err != nil {
@@ -439,7 +457,7 @@ func doRefresh(w http.ResponseWriter, r *http.Request) int8 {
 		return 0
 	}
 
-	_, err = getAccessToken(oauth2Token, oidcConfig)
+	_, err = getAccessToken(oauth2Token, oidcConfig, true)
 	if err != nil {
 		log.Println(getUserIP(r), err)
 		returnStatus(w, http.StatusInternalServerError, err.Error())
@@ -462,6 +480,12 @@ func logout(w http.ResponseWriter, r *http.Request, claims *accessTokenClaims) {
 }
 
 func beginOIDCLogin(w http.ResponseWriter, r *http.Request, redirectURL string) {
+
+	// don't redirect on websocket
+	if isWebSocket(r) {
+		returnStatus(w, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
 
 	// encode tenant, cookie path and original URL in state and start login sequence
 	cookiePath, err := getCookiePath(r)
@@ -487,6 +511,13 @@ func beginOIDCLogin(w http.ResponseWriter, r *http.Request, redirectURL string) 
 }
 
 func beginOIDCLogout(w http.ResponseWriter, r *http.Request) {
+
+	// don't redirect on websocket
+	if isWebSocket(r) {
+		returnStatus(w, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
+
 	oidcConfig, err := getOIDCConfig(r)
 	if err != nil {
 		returnStatus(w, http.StatusBadRequest, "Failed to retrieve OIDC configuration.")
@@ -520,7 +551,7 @@ func beginOIDCLogout(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, realURL, http.StatusFound)
 }
 
-func getAccessToken(oauth2Token *oauth2.Token, oidcConfig *oidcConfig) (*oidc.IDToken, error) {
+func getAccessToken(oauth2Token *oauth2.Token, oidcConfig *oidcConfig, storeRefresh bool) (*oidc.IDToken, error) {
 
 	rawIDToken, ok := oauth2Token.Extra("id_token").(string)
 	if !ok {
@@ -539,7 +570,7 @@ func getAccessToken(oauth2Token *oauth2.Token, oidcConfig *oidcConfig) (*oidc.ID
 	}
 
 	// Save refresh token if any in redis
-	if redisdb != nil && oauth2Token.RefreshToken != "" {
+	if storeRefresh && redisdb != nil && oauth2Token.RefreshToken != "" {
 
 		refreshToken, err := parseRefreshToken(oauth2Token.RefreshToken)
 		if err != nil {
