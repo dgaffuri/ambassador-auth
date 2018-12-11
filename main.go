@@ -3,8 +3,8 @@ package main
 import (
 	"log"
 	"net/http"
-	"os"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/gorilla/handlers"
@@ -12,17 +12,12 @@ import (
 )
 
 var router *mux.Router
-var listenPort string
 var tenantsRegexp string
 var basicAuthPrefixes string
+var redirectURL string
 var ipRegex = regexp.MustCompile(`^(.+?)(?::\d{0,5})?$`)
 
 func init() {
-	listenPort = os.Getenv("PORT")
-	if len(listenPort) == 0 {
-		log.Println("No port specified, using 8080 as default.")
-		listenPort = "8080"
-	}
 	tenants := []string{}
 	for tenant := range config.Tenants {
 		tenants = append(tenants, tenant)
@@ -85,7 +80,9 @@ func main() {
 
 	router.HandleFunc("/healthz", healthHandler).Methods(http.MethodGet)
 
-	router.Path("/login/oidc").HandlerFunc(oidcHandler).Methods(http.MethodGet)
+	for i := range redirectPaths {
+		router.Path(redirectPaths[i]).HandlerFunc(oidcHandler).Methods(http.MethodGet)
+	}
 
 	basic := router.PathPrefix("/{prefix:" + basicAuthPrefixes + "}/{tenant:" + tenantsRegexp + "}/").Subrouter()
 	basic.PathPrefix("/").HandlerFunc(ifLoggedIn(setClaims, basicAuthLogin))
@@ -97,7 +94,7 @@ func main() {
 
 	router.PathPrefix("/").HandlerFunc(noAuthHandler)
 
-	var listenAddr = ":" + listenPort
+	var listenAddr = ":" + strconv.Itoa(config.ListenPort)
 	log.Println("Starting web server at", listenAddr)
 	log.Fatal(http.ListenAndServe(listenAddr, handlers.CORS()(router)))
 }

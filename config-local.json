@@ -1,4 +1,5 @@
 {
+	"listen_port": 4200,
 	"basic_auth_prefixes": "mobile external",
 	"signing_key_file": "./ambassador.key",
 	"tenants": {
@@ -13,6 +14,22 @@
 			"client_id": "ambassador",
 			"client_secret": "47490e1d-ef74-4e4b-b409-9ca803c4fa08",
 			"oidc_scopes": "profile email"
+		},
+		"aruba": {
+			"oauth2_provider": {
+				"issuer": "Aruba SPA",
+				"authorization_endpoint": "https://devlispa.docfly.arubapec.it/uaa/oauth/authorize",
+				"token_endpoint": "https://devlispa.docfly.arubapec.it/uaa/oauth/token",
+				"jwks_uri": "https://devlispa.docfly.arubapec.it/uaa/.well-known/jwks"
+			},
+			"client_id": "reply-client",
+			"client_secret": "Passw0rd!",
+			"oidc_scopes": "auth",
+			"redirect_path": "/login-callback",
+			"broken_auth_header_provider": true,
+			"skip_client_id_check": true,
+			"user_path": "user_name",
+			"groups_path": "authorities"
 		}
 	},
 	"redis" : {

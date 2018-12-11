@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
-	"math/rand"
 	"mime"
 	"net/http"
 	"net/http/httputil"
@@ -18,20 +17,19 @@ import (
 	"time"
 
 	oidc "github.com/coreos/go-oidc"
-	"github.com/go-redis/redis"
 	"golang.org/x/oauth2"
 )
 
 type oidcConfig struct {
 	init         sync.Once
 	initErr      error
-	tenantConfig TenantConfig
+	tenantConfig *TenantConfig
 	config       *oidc.Config
-	provider     *oidc.Provider
 	oauth2Config oauth2.Config
+	logoutURL    string
+	verifier     *oidc.IDTokenVerifier
 	cookieDomain string
 	cookieSecure bool
-	logoutURL    string
 }
 
 type stateItem struct {
@@ -49,39 +47,11 @@ type refreshToken struct {
 	IssuedAt int64  `json:"iat"`
 }
 
-type accessTokenClaims struct {
-	JTI            string                            `json:"jti"`
-	Exp            int64                             `json:"exp"`
-	Username       string                            `json:"preferred_username"`
-	ResourceAccess map[string]map[string]interface{} `json:"resource_access"`
-}
-
 const cookieName = "auth"
 const expiryDelta = 10 * time.Second
 const tokenRefreshing = "REFRESHING"
 
-var ctx context.Context
-var oidcConfigMap = make(map[string]*oidcConfig)
-var redisdb *redis.Client
-
-func init() {
-
-	// prepare per tenant OIDC configuration for lazy initialization
-	ctx = context.Background()
-	for tenant, tenantConfig := range config.Tenants {
-		oidcConfigMap[tenant] = &oidcConfig{tenantConfig: tenantConfig}
-	}
-
-	rand.Seed(time.Now().UnixNano())
-
-	if config.Redis != nil {
-		redisdb = redis.NewClient(config.Redis)
-		_, err := redisdb.Ping().Result()
-		if err != nil {
-			log.Fatal("Problem connecting to Redis: ", err.Error())
-		}
-	}
-}
+var ctx = context.Background()
 
 func initConfig(r *http.Request, oidcConfig *oidcConfig) error {
 
@@ -96,18 +66,10 @@ func initConfig(r *http.Request, oidcConfig *oidcConfig) error {
 
 	tenantConfig := oidcConfig.tenantConfig
 
-	oidcURL, err := url.ParseRequestURI(tenantConfig.OIDCProvider)
-	if err != nil {
-		return err
-	}
-	oidcConfig.provider, err = oidc.NewProvider(ctx, oidcURL.String())
-	if err != nil {
-		return err
-	}
-
 	oidcConfig.config = &oidc.Config{
-		ClientID:        tenantConfig.ClientID,
-		SkipExpiryCheck: true,
+		ClientID:          tenantConfig.ClientID,
+		SkipClientIDCheck: tenantConfig.SkipClientIDCheck,
+		SkipExpiryCheck:   true,
 	}
 
 	host := r.Host
@@ -121,19 +83,41 @@ func initConfig(r *http.Request, oidcConfig *oidcConfig) error {
 	oidcConfig.oauth2Config = oauth2.Config{
 		ClientID:     tenantConfig.ClientID,
 		ClientSecret: tenantConfig.ClientSecret,
-		Endpoint:     oidcConfig.provider.Endpoint(),
-		RedirectURL:  proto + "://" + host + "/login/oidc",
-		Scopes:       append(strings.Split(tenantConfig.OIDCScopes, " "), oidc.ScopeOpenID),
+		RedirectURL:  proto + "://" + host + tenantConfig.RedirectPath,
+		Scopes:       strings.Split(tenantConfig.OIDCScopes, " "),
+	}
+
+	if tenantConfig.OIDCProvider != "" {
+		oidcURL, err := url.ParseRequestURI(tenantConfig.OIDCProvider)
+		if err != nil {
+			return err
+		}
+		provider, err := oidc.NewProvider(ctx, oidcURL.String())
+		if err != nil {
+			return err
+		}
+		oidcConfig.oauth2Config.Scopes = append(oidcConfig.oauth2Config.Scopes, oidc.ScopeOpenID)
+		oidcConfig.oauth2Config.Endpoint = provider.Endpoint()
+		oidcConfig.logoutURL, err = getLogoutURL(ctx, oidcURL.String())
+		if err != nil {
+			return err
+		}
+		oidcConfig.verifier = provider.Verifier(oidcConfig.config)
+	} else if tenantConfig.OAuth2Provider != nil {
+		oidcConfig.oauth2Config.Endpoint = oauth2.Endpoint{
+			AuthURL:  tenantConfig.OAuth2Provider.AuthURL,
+			TokenURL: tenantConfig.OAuth2Provider.TokenURL,
+		}
+		keySet := oidc.NewRemoteKeySet(ctx, tenantConfig.OAuth2Provider.JWKSURL)
+		oidcConfig.verifier = oidc.NewVerifier(tenantConfig.OAuth2Provider.Issuer, keySet, oidcConfig.config)
+	}
+
+	if tenantConfig.BrokenAuthHeaderProvider {
+		oauth2.RegisterBrokenAuthHeaderProvider(oidcConfig.oauth2Config.Endpoint.TokenURL)
 	}
 
 	oidcConfig.cookieDomain = strings.Split(r.Host, ":")[0]
 	oidcConfig.cookieSecure = proto == "https"
-
-	// not managed by oidc package
-	oidcConfig.logoutURL, err = getLogoutURL(ctx, oidcURL.String())
-	if err != nil {
-		return err
-	}
 
 	log.Println(getUserIP(r), r.URL.String(), "initialized", tenant, "OIDC config with",
 		"ClientID:", oidcConfig.oauth2Config.ClientID,
@@ -147,7 +131,7 @@ func initConfig(r *http.Request, oidcConfig *oidcConfig) error {
 	return nil
 }
 
-// from oidc.NewProvider
+// from oidc.NewProvider, not managed by oidc package
 func getLogoutURL(ctx context.Context, issuer string) (string, error) {
 	wellKnown := strings.TrimSuffix(issuer, "/") + "/.well-known/openid-configuration"
 	req, err := http.NewRequest("GET", wellKnown, nil)
@@ -230,8 +214,14 @@ func ifLoggedIn(yes func(w http.ResponseWriter, r *http.Request, claims *accessT
 
 		url := r.URL.String()
 
+		oidcConfig, err := getOIDCConfig(r)
+		if err != nil {
+			returnStatus(w, http.StatusBadRequest, "Failed to retrieve OIDC configuration.")
+			return
+		}
+
 		// check for valid access token in cookie or Authorization header
-		token, err := checkAccessToken(r)
+		token, err := checkAccessToken(r, oidcConfig)
 		if token == nil {
 			if err != nil {
 				log.Println(getUserIP(r), url, "Error retrieving access token:", err.Error())
@@ -241,51 +231,59 @@ func ifLoggedIn(yes func(w http.ResponseWriter, r *http.Request, claims *accessT
 		}
 
 		// get claims
-		var claims accessTokenClaims
-		err = token.Claims(&claims)
+		var rawClaims = make(map[string]interface{})
+		var claims *accessTokenClaims
+		err = token.Claims(&rawClaims)
+		if err == nil {
+			claims, err = GetClaims(rawClaims, oidcConfig.tenantConfig)
+		}
 		if err != nil {
 			log.Println(getUserIP(r), url, "Error getting token claims:", err.Error())
-			no(w, r)
+			returnStatus(w, http.StatusBadRequest, "Error getting token claims:.")
 			return
 		}
 
 		// check expiration and try to refresh if needed
 		if token.Expiry.Before(time.Now().Add(-expiryDelta)) {
 			if isWebSocket(r) {
-				log.Println(getUserIP(r), url, "Token expired but will not refresh on websocket for", claims.Username)
+				log.Println(getUserIP(r), url, "Token expired but will not refresh on websocket for", claims.User)
 				no(w, r)
 				return
 			}
 			switch doRefresh(w, r) {
 			case 0:
-				log.Println(getUserIP(r), url, "Token expired but can't refresh for", claims.Username)
+				log.Println(getUserIP(r), url, "Token expired but can't refresh for", claims.User)
 				no(w, r)
 				return
 			case 1:
-				log.Println(getUserIP(r), url, "Token is refreshing for", claims.Username, "allowing access")
+				log.Println(getUserIP(r), url, "Token is refreshing for", claims.User, "allowing access")
 			case 2:
-				log.Println(getUserIP(r), url, "Token refreshed for", claims.Username)
+				log.Println(getUserIP(r), url, "Token refreshed for", claims.User)
 				return
 			}
 		}
 
 		// logged in with signed access token
-		yes(w, r, &claims)
+		yes(w, r, claims)
 	}
 }
 
 func setClaims(w http.ResponseWriter, r *http.Request, claims *accessTokenClaims) {
-	oidcConfig, _ := getOIDCConfig(r)
-	w.Header().Set("X-Remote-User", claims.Username)
-	roles := ""
-	for _, role := range claims.ResourceAccess[oidcConfig.config.ClientID]["roles"].([]interface{}) {
-		if roles == "" {
-			roles = role.(string)
-		} else {
-			roles = roles + ";" + role.(string)
-		}
+	username := claims.User
+	if username != "" {
+		w.Header().Set("X-Remote-User", username)
 	}
-	w.Header().Set("X-Remote-Groups", roles)
+	if claims.Groups != nil {
+		roles := ""
+		for _, group := range claims.Groups {
+			if roles == "" {
+				roles = group
+			} else {
+				roles = roles + ";" + group
+			}
+		}
+		w.Header().Set("X-Remote-Groups", roles)
+	}
 	w.Header().Set("X-Tenant", getTenant(r))
 	w.Header().Set("X-Trusted", signedNonce())
 	returnStatus(w, http.StatusOK, "")
@@ -553,17 +551,21 @@ func beginOIDCLogout(w http.ResponseWriter, r *http.Request) {
 
 func getAccessToken(oauth2Token *oauth2.Token, oidcConfig *oidcConfig, storeRefresh bool) (*oidc.IDToken, error) {
 
-	rawIDToken, ok := oauth2Token.Extra("id_token").(string)
-	if !ok {
-		return nil, fmt.Errorf("no id_token field in OAuth 2.0 token")
+	verifier := oidcConfig.verifier
+
+	idToken := oauth2Token.Extra("id_token")
+	if idToken != nil {
+		rawIDToken, ok := idToken.(string)
+		if !ok {
+			return nil, fmt.Errorf("bad id_token field in OAuth 2.0 token: %v", idToken)
+		}
+		_, err := verifier.Verify(ctx, rawIDToken)
+		if err != nil {
+			return nil, fmt.Errorf("unable to verify ID token: %v", err)
+		}
 	}
 
 	// Verifying received ID token
-	verifier := oidcConfig.provider.Verifier(oidcConfig.config)
-	_, err := verifier.Verify(ctx, rawIDToken)
-	if err != nil {
-		return nil, fmt.Errorf("unable to verify ID token: %v", err)
-	}
 	accessToken, err := verifier.Verify(ctx, oauth2Token.AccessToken)
 	if err != nil {
 		return nil, fmt.Errorf("unable to verify Access token: %v", err)
@@ -627,7 +629,7 @@ func addCookie(w http.ResponseWriter, ip string, url string, tokenString string,
 	http.SetCookie(w, cookie)
 }
 
-func checkAccessToken(r *http.Request) (*oidc.IDToken, error) {
+func checkAccessToken(r *http.Request, oidcConfig *oidcConfig) (*oidc.IDToken, error) {
 	var encoded string
 	header := r.Header.Get("Authorization")
 	if strings.HasPrefix(header, "Bearer ") {
@@ -642,11 +644,7 @@ func checkAccessToken(r *http.Request) (*oidc.IDToken, error) {
 		}
 		encoded = cookie.Value
 	}
-	oidcConfig, err := getOIDCConfig(r)
-	if err != nil {
-		return nil, err
-	}
-	verifier := oidcConfig.provider.Verifier(oidcConfig.config)
+	verifier := oidcConfig.verifier
 	token, err := verifier.Verify(ctx, encoded)
 	if err != nil {
 		return nil, err
