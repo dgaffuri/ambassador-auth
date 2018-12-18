@@ -24,6 +24,8 @@ type Config struct {
 	ListenPort        int                      `json:"listen_port"`
 	BasicAuthPrefixes string                   `json:"basic_auth_prefixes"`
 	SigningKeyFile    string                   `json:"signing_key_file"`
+	TracingURL        string                   `json:"tracing_url"`
+	TracingService    string                   `json:"tracing_service"`
 	Tenants           map[string]*TenantConfig `json:"tenants"`
 	Redis             *redis.Options           `json:"redis"`
 }

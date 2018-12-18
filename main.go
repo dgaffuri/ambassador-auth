@@ -94,6 +94,10 @@ func main() {
 
 	router.PathPrefix("/").HandlerFunc(noAuthHandler)
 
+	if middleware != nil {
+		router.Use(middleware)
+	}
+
 	var listenAddr = ":" + strconv.Itoa(config.ListenPort)
 	log.Println("Starting web server at", listenAddr)
 	log.Fatal(http.ListenAndServe(listenAddr, handlers.CORS()(router)))

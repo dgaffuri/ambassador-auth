@@ -138,7 +138,7 @@ func getLogoutURL(ctx context.Context, issuer string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	resp, err := doRequest(ctx, req)
+	resp, err := http.DefaultClient.Do(req.WithContext(ctx))
 	if err != nil {
 		return "", err
 	}
@@ -163,14 +163,6 @@ func getLogoutURL(ctx context.Context, issuer string) (string, error) {
 		return "", fmt.Errorf("oidc: issuer did not match the issuer returned by provider, expected %q got %q", issuer, p["issuer"])
 	}
 	return p["end_session_endpoint"].(string), nil
-}
-
-func doRequest(ctx context.Context, req *http.Request) (*http.Response, error) {
-	client := http.DefaultClient
-	if c, ok := ctx.Value(oauth2.HTTPClient).(*http.Client); ok {
-		client = c
-	}
-	return client.Do(req.WithContext(ctx))
 }
 
 func unmarshalResp(r *http.Response, body []byte, v interface{}) error {
