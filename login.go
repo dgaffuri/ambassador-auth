@@ -237,6 +237,11 @@ func ifLoggedIn(yes func(w http.ResponseWriter, r *http.Request, claims *accessT
 
 		// check expiration and try to refresh if needed
 		if token.Expiry.Before(time.Now().Add(-expiryDelta)) {
+			if redisdb == nil {
+				log.Println(getUserIP(r), url, "Token expired but will not refresh because Redis is not available", claims.User)
+				no(w, r)
+				return
+			}
 			if isWebSocket(r) {
 				log.Println(getUserIP(r), url, "Token expired but will not refresh on websocket for", claims.User)
 				no(w, r)
